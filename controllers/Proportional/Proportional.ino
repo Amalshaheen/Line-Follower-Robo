@@ -1,4 +1,4 @@
-// === Motor Pins (same as before) ===
+// === Motor Pins ===
 #define ENA 18
 #define IN1 21
 #define IN2 22
