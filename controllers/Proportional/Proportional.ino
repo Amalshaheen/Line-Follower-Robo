@@ -183,6 +183,7 @@ void readSensors() {
       case 2: pin = IR3; break;
       case 3: pin = IR4; break;
       case 4: pin = IR5; break;
+      
     }
     int value = digitalRead(pin);
     Serial.print("S");
