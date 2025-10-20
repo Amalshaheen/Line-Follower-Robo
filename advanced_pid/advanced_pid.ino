@@ -1,5 +1,9 @@
 // Enhanced PID Line Follower for ESP32 + L298N + 5 IR Sensors
-// With time-based PID, non-blocking recovery, and serial tuning
+// With time-based PID, non-blocking recovery, and Bluetooth tuning
+
+#include "BluetoothSerial.h"
+
+BluetoothSerial SerialBT;
 
 const int sensorPins[] = { 34, 35, 32, 33, 25 };
 const int sensorCount = 5;
@@ -16,19 +20,18 @@ const int statusLED = 2;
 
 // === PID CONFIGURATION STRUCT ===
 struct PIDConfig {
-  float Kp = 15.0;  // Reduced from 34
+  float Kp = 10.0;  // Reduced from 34
   float Ki = 0.0;   // Enabled integral
-  float Kd = 80.0;  // Reduced from 150
-  int baseSpeed = 120;
-  int maxSpeed = 200;
+  float Kd = 0.0;  // Reduced from 150
+  int baseSpeed = 100;
+  int maxSpeed = 255;
 };
 
 PIDConfig config;
 
 // Recovery parameters
 const int recoverSpeed = 65;
-const unsigned long recoverTimeout = 500;  // ms
-const int recoverDuration = 50;            // ms
+const unsigned long recoverTimeout = 6000;  // ms
 
 // Global variables
 float error = 0, lastError = 0, integral = 0;
@@ -42,16 +45,12 @@ unsigned long lastDebugTime = 0;
 const float INTEGRAL_LIMIT = 100.0;
 const float DEADBAND_THRESHOLD = 0.1;
 
-// Sensor calibration
-int sensorMin[5] = { 4095, 4095, 4095, 4095, 4095 };
-int sensorMax[5] = { 0, 0, 0, 0, 0 };
-bool calibrated = false;
-
 void setup() {
-  Serial.begin(115200);
-  Serial.println("=== Enhanced Line Follower ===");
-  Serial.println("Commands: KP, KI, KD, BASE, MAX, CAL, START, STOP");
-  Serial.println("Example: KP 20.5");
+  SerialBT.begin("ESP32_LineFollower"); // Bluetooth device name
+  SerialBT.println("=== Enhanced Line Follower ===");
+  SerialBT.println("Commands: KP, KI, KD, BASE, MAX, CAL, START, STOP");
+  SerialBT.println("Example: KP 20.5");
+  SerialBT.println("Connect to ESP32_LineFollower via Bluetooth");
 
   // Initialize pins
   for (int i = 0; i < sensorCount; i++) pinMode(sensorPins[i], INPUT);
@@ -68,9 +67,6 @@ void setup() {
 
   stopMotors();
 
-  // Auto-calibrate on startup
-  calibrateSensors();
-
   lastPIDTime = micros();
 }
 
@@ -82,8 +78,7 @@ void loop() {
     pidLineFollow();
   } else {
     // Read and display sensors when inactive
-    if (millis() - lastDebugTime > 1000) {
-      readAndPrintSensors();
+    if (millis() - lastDebugTime > 200) {
       lastDebugTime = millis();
     }
     delay(100);
@@ -101,7 +96,7 @@ void checkButton() {
       recovering = false;
 
       String msg = robotActive ? "STARTED" : "STOPPED";
-      Serial.println("Robot " + msg);
+      SerialBT.println("Robot " + msg);
 
       // Reset timing
       lastPIDTime = micros();
@@ -126,23 +121,22 @@ void pidLineFollow() {
 
   // Read calibrated sensors
   for (int i = 0; i < sensorCount; i++) {
-    sensorValues[i] = readCalibratedSensor(i);
+    sensorValues[i] = !(digitalRead(sensorPins[i]));
     positionSum += sensorValues[i] * sensorWeights[i];
     activeSensors += sensorValues[i];
   }
 
-  // === Non-blocking Line Lost Recovery ===
   if (activeSensors == 0) {
     if (!recovering) {
       lineLostTime = millis();
       recovering = true;
       integral = 0;  // Reset integral during recovery
-      Serial.println("Line lost - recovering...");
+      SerialBT.println("Line lost - recovering...");
     }
 
     // Check if recovery timeout exceeded
     if (millis() - lineLostTime > recoverTimeout) {
-      Serial.println("Line lost for too long - STOPPING");
+      SerialBT.println("Line lost for too long - STOPPING");
       stopMotors();
       robotActive = false;
       digitalWrite(statusLED, LOW);
@@ -150,7 +144,7 @@ void pidLineFollow() {
     }
 
     // Recovery maneuver based on last known error
-    if (lastError > 0) {
+    if (lastError < 0) {
       setMotorSpeed(-recoverSpeed, recoverSpeed);  // Turn left
     } else {
       setMotorSpeed(recoverSpeed, -recoverSpeed);  // Turn right
@@ -159,7 +153,7 @@ void pidLineFollow() {
     return;
   } else {
     if (recovering) {
-      Serial.println("Line found!");
+      SerialBT.println("Line found!");
       recovering = false;
     }
   }
@@ -183,13 +177,8 @@ void pidLineFollow() {
   // === PID Output ===
   float output = (config.Kp * P) + (config.Ki * integral) + (config.Kd * D);
 
-  // === Dynamic Speed Scaling ===
-  // Less aggressive scaling
-  float speedFactor = 1.0 - min(abs(error) / 2.5, 0.4);
-  int adjustedBase = config.baseSpeed * speedFactor + 80;
-
-  int leftSpeed = constrain(adjustedBase - output, -config.maxSpeed, config.maxSpeed);
-  int rightSpeed = constrain(adjustedBase + output, -config.maxSpeed, config.maxSpeed);
+  int leftSpeed = constrain(config.baseSpeed - output, -config.maxSpeed, config.maxSpeed);
+  int rightSpeed = constrain(config.baseSpeed + output, -config.maxSpeed, config.maxSpeed);
 
   setMotorSpeed(leftSpeed, rightSpeed);
 
@@ -200,63 +189,10 @@ void pidLineFollow() {
   }
 }
 
-// === SENSOR CALIBRATION FUNCTIONS ===
-void calibrateSensors() {
-  Serial.println("Calibrating sensors... Move over line and background");
-  digitalWrite(statusLED, HIGH);
-
-  // Reset calibration
-  for (int i = 0; i < sensorCount; i++) {
-    sensorMin[i] = 4095;
-    sensorMax[i] = 0;
-  }
-
-  // Calibrate for 3 seconds
-  unsigned long startTime = millis();
-  while (millis() - startTime < 3000) {
-    for (int i = 0; i < sensorCount; i++) {
-      int value = analogRead(sensorPins[i]);
-      if (value < sensorMin[i]) sensorMin[i] = value;
-      if (value > sensorMax[i]) sensorMax[i] = value;
-    }
-    delay(10);
-  }
-
-  calibrated = true;
-  digitalWrite(statusLED, LOW);
-
-  Serial.println("Calibration complete:");
-  for (int i = 0; i < sensorCount; i++) {
-    Serial.print("S");
-    Serial.print(i);
-    Serial.print(": ");
-    Serial.print(sensorMin[i]);
-    Serial.print("-");
-    Serial.print(sensorMax[i]);
-    Serial.print(" ");
-  }
-  Serial.println();
-}
-
-int readCalibratedSensor(int sensorIndex) {
-  int rawValue = analogRead(sensorPins[sensorIndex]);
-
-  if (!calibrated) {
-    // Fallback to digital reading if not calibrated
-    return rawValue > 2000 ? 1 : 0;  // Simple threshold
-  }
-
-  // Map to 0-1000 range and apply threshold
-  int calibratedValue = map(rawValue, sensorMin[sensorIndex], sensorMax[sensorIndex], 0, 1000);
-  calibratedValue = constrain(calibratedValue, 0, 1000);
-
-  return calibratedValue > 600 ? 1 : 0;  // Threshold for line detection
-}
-
-// === SERIAL COMMAND PROCESSING ===
+// === BLUETOOTH COMMAND PROCESSING ===
 void checkSerialCommands() {
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
+  if (SerialBT.available()) {
+    String input = SerialBT.readStringUntil('\n');
     input.trim();
 
     if (input.length() > 0) {
@@ -279,130 +215,113 @@ void processCommand(String command) {
 
   if (cmd == "kp" && valueStr != "") {
     config.Kp = valueStr.toFloat();
-    Serial.println("Kp set to: " + String(config.Kp));
+    SerialBT.println("Kp set to: " + String(config.Kp));
   } else if (cmd == "ki" && valueStr != "") {
     config.Ki = valueStr.toFloat();
-    Serial.println("Ki set to: " + String(config.Ki));
+    SerialBT.println("Ki set to: " + String(config.Ki));
   } else if (cmd == "kd" && valueStr != "") {
     config.Kd = valueStr.toFloat();
-    Serial.println("Kd set to: " + String(config.Kd));
+    SerialBT.println("Kd set to: " + String(config.Kd));
   } else if (cmd == "base" && valueStr != "") {
     config.baseSpeed = valueStr.toInt();
-    Serial.println("Base speed set to: " + String(config.baseSpeed));
+    SerialBT.println("Base speed set to: " + String(config.baseSpeed));
   } else if (cmd == "max" && valueStr != "") {
     config.maxSpeed = valueStr.toInt();
-    Serial.println("Max speed set to: " + String(config.maxSpeed));
-  } else if (cmd == "cal") {
-    calibrateSensors();
+    SerialBT.println("Max speed set to: " + String(config.maxSpeed));
   } else if (cmd == "start") {
     robotActive = true;
     digitalWrite(statusLED, HIGH);
-    Serial.println("Started via serial");
+    SerialBT.println("Started via Bluetooth");
   } else if (cmd == "stop") {
     robotActive = false;
     digitalWrite(statusLED, LOW);
     stopMotors();
-    Serial.println("Stopped via serial");
+    SerialBT.println("Stopped via Bluetooth");
   } else if (cmd == "status") {
     printStatus();
   } else if (cmd == "help") {
     printHelp();
   } else {
-    Serial.println("Unknown command: " + command);
-    Serial.println("Type 'help' for available commands");
+    SerialBT.println("Unknown command: " + command);
+    SerialBT.println("Type 'help' for available commands");
   }
 }
 
 void printStatus() {
-  Serial.println("=== CURRENT STATUS ===");
-  Serial.println("PID Values: Kp=" + String(config.Kp) + " Ki=" + String(config.Ki) + " Kd=" + String(config.Kd));
-  Serial.println("Speeds: Base=" + String(config.baseSpeed) + " Max=" + String(config.maxSpeed));
-  Serial.println("Robot: " + String(robotActive ? "RUNNING" : "STOPPED"));
-  Serial.println("Calibrated: " + String(calibrated ? "YES" : "NO"));
+  SerialBT.println("=== CURRENT STATUS ===");
+  SerialBT.println("PID Values: Kp=" + String(config.Kp) + " Ki=" + String(config.Ki) + " Kd=" + String(config.Kd));
+  SerialBT.println("Speeds: Base=" + String(config.baseSpeed) + " Max=" + String(config.maxSpeed));
+  SerialBT.println("Robot: " + String(robotActive ? "RUNNING" : "STOPPED"));
 }
 
 void printHelp() {
-  Serial.println("=== AVAILABLE COMMANDS ===");
-  Serial.println("KP <value>   - Set proportional gain");
-  Serial.println("KI <value>   - Set integral gain");
-  Serial.println("KD <value>   - Set derivative gain");
-  Serial.println("BASE <value> - Set base speed");
-  Serial.println("MAX <value>  - Set max speed");
-  Serial.println("CAL          - Calibrate sensors");
-  Serial.println("START        - Start robot");
-  Serial.println("STOP         - Stop robot");
-  Serial.println("STATUS       - Show current settings");
-  Serial.println("HELP         - Show this help");
+  SerialBT.println("=== AVAILABLE COMMANDS ===");
+  SerialBT.println("KP <value>   - Set proportional gain");
+  SerialBT.println("KI <value>   - Set integral gain");
+  SerialBT.println("KD <value>   - Set derivative gain");
+  SerialBT.println("BASE <value> - Set base speed");
+  SerialBT.println("MAX <value>  - Set max speed");
+  SerialBT.println("CAL          - Calibrate sensors");
+  SerialBT.println("START        - Start robot");
+  SerialBT.println("STOP         - Stop robot");
+  SerialBT.println("STATUS       - Show current settings");
+  SerialBT.println("HELP         - Show this help");
 }
 
 // === DEBUG AND MONITORING ===
 void debugOutput(int sensorValues[], float error, float output,
                  int leftSpeed, int rightSpeed, float elapsedTime) {
-  Serial.print("Sensors: ");
+  SerialBT.print("Sensors: ");
   for (int i = 0; i < sensorCount; i++) {
-    Serial.print(sensorValues[i]);
-    Serial.print(" ");
+    SerialBT.print(sensorValues[i]);
+    SerialBT.print(" ");
   }
 
-  Serial.print("| Error: ");
-  Serial.print(error, 3);
+  SerialBT.print("| Error: ");
+  SerialBT.print(error, 3);
 
-  Serial.print(" | PID: ");
-  Serial.print(config.Kp * error, 1);
-  Serial.print(",");
-  Serial.print(config.Ki * integral, 1);
-  Serial.print(",");
-  Serial.print(config.Kd * (error - lastError) / elapsedTime, 1);
+  SerialBT.print(" | PID: ");
+  SerialBT.print(config.Kp * error, 1);
+  SerialBT.print(",");
+  SerialBT.print(config.Ki * integral, 1);
+  SerialBT.print(",");
+  SerialBT.print(config.Kd * (error - lastError) / elapsedTime, 1);
 
-  Serial.print(" | Output: ");
-  Serial.print(output, 1);
+  SerialBT.print(" | Output: ");
+  SerialBT.print(output, 1);
 
-  Serial.print(" | Motors: ");
-  Serial.print(leftSpeed);
-  Serial.print(",");
-  Serial.print(rightSpeed);
+  SerialBT.print(" | Motors: ");
+  SerialBT.print(leftSpeed);
+  SerialBT.print(",");
+  SerialBT.print(rightSpeed);
 
-  Serial.print(" | Time: ");
-  Serial.print(elapsedTime * 1000, 1);
-  Serial.println("ms");
+  SerialBT.print(" | Time: ");
+  SerialBT.print(elapsedTime * 1000, 1);
+  SerialBT.println("ms");
 }
 
-void readAndPrintSensors() {
-  Serial.print("Raw Sensors: ");
-  for (int i = 0; i < sensorCount; i++) {
-    int raw = analogRead(sensorPins[i]);
-    int calibrated = readCalibratedSensor(i);
-    Serial.print("S");
-    Serial.print(i);
-    Serial.print(":");
-    Serial.print(raw);
-    Serial.print("(");
-    Serial.print(calibrated);
-    Serial.print(") ");
-  }
-  Serial.println();
-}
+
 
 // === MOTOR CONTROL (Unchanged) ===
 void setMotorSpeed(int left, int right) {
   // Left motor → ENB, IN3, IN4
-  if (left >= 0) {
+  if (right >= 0) {
     digitalWrite(in3, HIGH);
     digitalWrite(in4, LOW);
   } else {
     digitalWrite(in3, LOW);
     digitalWrite(in4, HIGH);
-    left = -left;
+    right = -right;
   }
 
   // Right motor → ENA, IN1, IN2
-  if (right >= 0) {
+  if (left >= 0) {
     digitalWrite(in1, HIGH);
     digitalWrite(in2, LOW);
   } else {
     digitalWrite(in1, LOW);
     digitalWrite(in2, HIGH);
-    right = -right;
+    left = -left;
   }
 
   analogWrite(enA, constrain(right, 0, config.maxSpeed));
